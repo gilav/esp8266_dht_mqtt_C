@@ -1,25 +1,53 @@
-#include <DHT.h>
-#include <DHT_U.h>
+//
+// Read DHT11/22 temperature and humidity values and send them to MQTT server
+// What it does is:
+//   scan WIFI for known access points
+//   if AP found, connect wifi, connect to MQTT server using TLD and start poling DHT sensor and publish temperature and humidity.
+//   publish also free ram and uptime, for test purpose
+//   blinking LED as in the NodeMcu project.
+//
+// Lavaux Gilles 2017-06
+//
 
 #include <Time.h>
+// DHT libs:
+#include <DHT.h>
+#include <DHT_U.h>
+// ESP8266:
 #include <ESP8266WiFi.h>
+// MQTT libs:
 #include "Adafruit_MQTT.h"
 #include "Adafruit_MQTT_Client.h"
-#include <SPI.h>
+// flash filesystem lib:
 #include "FS.h"
 
 
-#define VERSION "V:0.6.00 Lavaux Gilles 06/2017"
+#define VERSION "V:0.6.04 Lavaux Gilles 06/2017"
 
 // DHT sensor
 #define DHTPIN 4        // GPIO 4 == D2
 #define DHTTYPE DHT11   // DHT 11
+// LED
+#define LED 0 // GPIO 0
+#define LED_BLUE 2  // onboard blue led
 
 // MQTT settings
 #define AIO_SERVER      "MQTT_BROKER_ADDRESS"
 #define AIO_SERVERPORT  7901
 #define AIO_USERNAME    "MQTT_USER"
 #define AIO_PASSWORD    "MQTT_PASSWORD"
+
+
+// status: used in loop to blink led
+#define NO_WIFI 1
+#define AP_FOUND 10
+#define IP_OK 40
+#define MQTT_OK 100
+int status=NO_WIFI;
+
+// LED
+boolean toggle=false;
+boolean useOnBoardLed=true;
 
 // MQTT topic
 const char *MQTT_TOPIC = "portable/esp_";
@@ -31,8 +59,11 @@ const char *ssid[2] = {"AP_1", "AP_2"};
 const char *pass[2] = {"password_AP1", "password_AP2"};
 const int apCount = 2;
 
-// loop interval used to scan AP + read DHT: 10 sec
-long loopInterval = 10000;
+// loops:
+long baseLoopInterval = 50;
+long previousBaseLoopInterval = 0;
+// AP interval used to scan AP + read DHT: 10 sec
+long apLoopInterval = 10000;
 long previousLoopMillis = 0;
 // mqtt ping interval: 2 mins
 long pingInterval = 120000;
@@ -53,6 +84,7 @@ float uptime;
 
 // init dht object
 DHT dht(DHTPIN, DHTTYPE, 20);
+
 
 // wifi client: unsecure or secure
 //WiFiClient client;
@@ -76,10 +108,20 @@ void setup() {
   Serial.begin(115200);
   delay(10);
 
-  Serial.printf("The ESP8266 chip ID as a 32-bit integer: %08X\n", ESP.getChipId());
-  Serial.printf("The flash chip ID as a 32-bit integer: %08X\n", ESP.getFlashChipId());
-  Serial.printf("Flash chip frequency: %d (Hz)\n", ESP.getFlashChipSpeed());
-  Serial.print("will publish on topic:");
+  // use onboard led?
+  if(useOnBoardLed){
+    Serial.print(" using buildin led:");
+    Serial.print(LED_BLUE);
+    Serial.println(" as output.");
+    pinMode(LED_BLUE, OUTPUT);
+  }else{
+    Serial.println(" don't use buildin led.");
+  }
+
+  Serial.printf(" the ESP8266 chip ID as a 32-bit integer: %08X\n", ESP.getChipId());
+  Serial.printf(" the flash chip ID as a 32-bit integer: %08X\n", ESP.getFlashChipId());
+  Serial.printf(" flash chip frequency: %d (Hz)\n", ESP.getFlashChipSpeed());
+  Serial.print(" will publish on topic:");
   Serial.println(fullTopicMem);
   
   WiFi.mode(WIFI_STA);
@@ -89,6 +131,18 @@ void setup() {
   WiFi.disconnect();
   Serial.println(" WIFI reset");
   delay(100);
+}
+
+//
+// change status, reset previousBaseLoopInterval in order to activate base loop test
+//
+void changeStatus(int s){
+  Serial.print(" ##################### change status from: ");
+  Serial.print(status);
+  Serial.print(" to: ");
+  Serial.println(s);
+  status=s;
+  previousBaseLoopInterval =  millis();
 }
 
 //
@@ -232,6 +286,7 @@ boolean mqtt_connect() {
   if (mqtt.connected()) {
     return true;
   }
+  changeStatus(IP_OK);
 
   // set system time 
   setTime(2);
@@ -249,10 +304,14 @@ boolean mqtt_connect() {
   while ((ret = mqtt.connect()) != 0) { // connect will return 0 for connected
        Serial.print("  !! MQTT connect error: ");
        Serial.print(mqtt.connectErrorString(ret));
-        Serial.println(" !!");
+       Serial.println(" !!");
        Serial.println("  retrying MQTT connection in 5 seconds...");
        mqtt.disconnect();
-       delay(5000);  // wait 5 seconds
+       unsigned long msecLimit = millis() + 5000;
+       while(baseAction() < msecLimit){
+          delay(100);
+          //Serial.println("  mqtt retry loop");
+       }
        retries--;
        if (retries == 0) {
          return false;
@@ -260,6 +319,7 @@ boolean mqtt_connect() {
   }
 
   Serial.println("  MQTT Connected!");
+  changeStatus(MQTT_OK);
   return true;
 }
 
@@ -282,6 +342,7 @@ void doPublish(){
   } else {
     Serial.println(F(" OK"));
   }
+  baseAction();
 
   // uptime
   Serial.print("  publishing uptime[");
@@ -293,6 +354,7 @@ void doPublish(){
   } else {
     Serial.println(F(" OK"));
   }
+  baseAction();
   
   // temp
   Serial.print("  publishing temp[");
@@ -304,6 +366,7 @@ void doPublish(){
   } else {
     Serial.println(F(" OK"));
   }
+  baseAction();
   
   // humi
   Serial.print("  publishing humi[");
@@ -315,6 +378,7 @@ void doPublish(){
   } else {
     Serial.println(F(" OK"));
   }
+  baseAction();
   publishCount++;
 }
 
@@ -322,6 +386,7 @@ void doPublish(){
 // use an access point
 //
 boolean useAp(const char *ssid, const char *password){
+  changeStatus(AP_FOUND);
   Serial.println();
   Serial.print("   connecting to ");
   Serial.print(ssid);
@@ -331,9 +396,13 @@ boolean useAp(const char *ssid, const char *password){
   int limit=15;
   WiFi.begin(ssid, password);
   while ((WiFi.status() != WL_CONNECTED) && (limit > 0)) {
-    limit--;
-    delay(1000);
+    unsigned long msecLimit = millis() + 1000;
+    while(baseAction() < msecLimit){
+       delay(100);
+       //Serial.println("  wifi waiting loop");
+    }
     Serial.print("_-");
+    limit--;
   }
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("");
@@ -390,6 +459,7 @@ void scanAp(){
           Serial.print("  known AP found !!");
           apFound = useAp(ssid[j], pass[j]);
           if(apFound){
+            changeStatus(IP_OK);
             break;
           }
         }else{
@@ -412,12 +482,40 @@ void wifiAndMqttConnect(){
       if(WiFi.status() != WL_CONNECTED){
         Serial.println("  AP was found, but disconnected! rescan wifi...");
         apFound=false;
+        changeStatus(NO_WIFI);
         scanAp();
       }else{
-        //Serial.println("  AP already found and connected");
         mqtt_connect();
       }
     }
+}
+
+//
+// base loop action: handle led blinking
+//
+unsigned long baseAction(){
+    unsigned long currentMillis = millis();
+    if(currentMillis - previousBaseLoopInterval > baseLoopInterval*status){
+      previousBaseLoopInterval = currentMillis;
+      //Serial.print(" base loop with status:");
+      //Serial.println(status);
+      if (toggle) {
+        if(useOnBoardLed){
+          digitalWrite(LED_BLUE, HIGH);
+        }else{
+          digitalWrite(LED, HIGH);
+        }
+        toggle = false;
+      } else {
+        if(useOnBoardLed){
+          digitalWrite(LED_BLUE, LOW);
+        }else{
+          digitalWrite(LED, LOW);
+        }
+        toggle = true;
+      }
+    }
+    return currentMillis;
 }
 
 
@@ -425,8 +523,9 @@ void wifiAndMqttConnect(){
 // main loop
 //
 void loop(){
-    unsigned long currentMillis = millis();
-    if(currentMillis - previousLoopMillis > loopInterval) {
+    //unsigned long currentMillis = millis();
+    unsigned long currentMillis = baseAction();
+    if(currentMillis - previousLoopMillis > apLoopInterval) {
       previousLoopMillis = currentMillis;
       wifiAndMqttConnect();
     }else if(currentMillis - previousLoopMillis <0){
@@ -446,6 +545,8 @@ void loop(){
     }
     if(currentMillis - previousPingMillis > pingInterval) {
       previousPingMillis = currentMillis;
-      mqtt.ping();
+      if (mqtt.connected()){
+        mqtt.ping();
+      }
     }
 }
